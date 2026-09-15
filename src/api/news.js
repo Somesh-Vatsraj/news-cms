@@ -2,7 +2,7 @@ import { ok, fail } from '../utils/response.js';
 import { readJson, requireFields, parseIntSafe } from '../utils/validation.js';
 import { slugify, uniqueSlug } from '../utils/slug.js';
 import { sanitizeHtml } from '../utils/sanitize.js';
-import { requireAdmin, requireAdminOnly } from '../middleware/auth.js';
+import { requireAdmin } from '../middleware/auth.js';
 
 function shapeArticle(row) {
   if (!row) return null;
@@ -33,7 +33,28 @@ const SELECT_BASE = `
   LEFT JOIN authors   a ON a.id = n.author_id
 `;
 
-/** Public list (only published + public visibility + published_at <= now) */
+/* ---------- HELPERS ---------- */
+function normalizeDate(v) {
+  if (!v) return null;
+  let s = String(v).trim();
+  if (!s) return null;
+  s = s.replace(/Z$/, '');
+  if (s.includes('T')) {
+    s = s.replace('T', ' ');
+    if (s.length === 16) s += ':00';
+  }
+  return s;
+}
+function normalizeFk(v) {
+  if (v === '' || v === null || v === undefined) return null;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+function toBit(v) {
+  return (v === true || v === 1 || v === '1' || v === 'true' || v === 'on') ? 1 : 0;
+}
+
+/* ---------- PUBLIC LIST ---------- */
 export async function listPublic(request, env) {
   const url = new URL(request.url);
   const limit = Math.min(parseIntSafe(url.searchParams.get('limit'), 20), 60);
@@ -83,11 +104,9 @@ export async function listTrending(request, env) {
 export async function getBySlug(request, env, slug) {
   const row = await env.DB.prepare(`${SELECT_BASE} WHERE n.slug = ? LIMIT 1`).bind(slug).first();
   if (!row) return fail('Article not found', 404);
-  if (row.status !== 'published' && row.visibility !== 'public') {
-    // Allow admins to preview? For public route we 404.
+  if (row.status !== 'published' || row.visibility !== 'public') {
     return fail('Article not found', 404);
   }
-  // fire and forget view increment
   env.DB.prepare(`UPDATE news SET views = views + 1 WHERE id = ?`).bind(row.id).run().catch(() => {});
   return ok({ article: shapeArticle(row) });
 }
@@ -104,7 +123,7 @@ export async function related(request, env, slug) {
   return ok({ items: rows.results.map(shapeArticle) });
 }
 
-/** Admin list — includes drafts, scheduled, etc. */
+/* ---------- ADMIN LIST ---------- */
 export async function listAdmin(request, env) {
   const auth = await requireAdmin(request, env);
   if (auth.error) return auth.error;
@@ -139,10 +158,11 @@ export async function listAdmin(request, env) {
   });
 }
 
+/* ---------- TAGS ---------- */
 async function saveTags(env, newsId, tagsString) {
-  if (!tagsString) return;
-  const names = String(tagsString).split(',').map(s => s.trim()).filter(Boolean).slice(0, 20);
+  if (tagsString === undefined) return;
   await env.DB.prepare(`DELETE FROM news_tags WHERE news_id = ?`).bind(newsId).run();
+  const names = String(tagsString || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 20);
   for (const name of names) {
     const slug = slugify(name);
     if (!slug) continue;
@@ -155,39 +175,53 @@ async function saveTags(env, newsId, tagsString) {
   }
 }
 
+/* ---------- CREATE ---------- */
 export async function create(request, env) {
   const auth = await requireAdmin(request, env);
   if (auth.error) return auth.error;
   const body = await readJson(request);
+
   const missing = requireFields(body, ['title']);
   if (missing.length) return fail('Title is required.', 400);
 
-  const baseSlug = slugify(body.slug || body.title);
+  const baseSlug = slugify(body.slug || body.title) || 'untitled';
   const slug = await uniqueSlug(env.DB, 'news', baseSlug);
 
-  const status = ['draft','published','scheduled','archived'].includes(body.status) ? body.status : 'draft';
+  const status = ['draft', 'published', 'scheduled', 'archived'].includes(body.status) ? body.status : 'draft';
   const visibility = body.visibility === 'private' ? 'private' : 'public';
-  let publishedAt = body.published_at || null;
-  if (status === 'published' && !publishedAt) publishedAt = new Date().toISOString();
+  const categoryId = normalizeFk(body.category_id);
+  const authorId = normalizeFk(body.author_id);
+
+  let publishedAt = normalizeDate(body.published_at);
+  const scheduledAt = normalizeDate(body.scheduled_at);
+  if (status === 'published' && !publishedAt) {
+    publishedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  }
 
   const content = sanitizeHtml(body.content || '');
 
-  const res = await env.DB.prepare(
-    `INSERT INTO news
-      (title, slug, excerpt, content, featured_image, thumbnail, category_id, author_id,
-       status, visibility, is_featured, is_trending, is_breaking,
-       meta_title, meta_description, meta_keywords, canonical_url,
-       published_at, scheduled_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(
-    body.title, slug, body.excerpt || '', content,
-    body.featured_image || '', body.thumbnail || '',
-    body.category_id || null, body.author_id || null,
-    status, visibility,
-    body.is_featured ? 1 : 0, body.is_trending ? 1 : 0, body.is_breaking ? 1 : 0,
-    body.meta_title || '', body.meta_description || '', body.meta_keywords || '', body.canonical_url || '',
-    publishedAt, body.scheduled_at || null
-  ).run();
+  let res;
+  try {
+    res = await env.DB.prepare(
+      `INSERT INTO news
+        (title, slug, excerpt, content, featured_image, thumbnail, category_id, author_id,
+         status, visibility, is_featured, is_trending, is_breaking,
+         meta_title, meta_description, meta_keywords, canonical_url,
+         published_at, scheduled_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      body.title, slug, body.excerpt || '', content,
+      body.featured_image || '', body.thumbnail || '',
+      categoryId, authorId,
+      status, visibility,
+      toBit(body.is_featured), toBit(body.is_trending), toBit(body.is_breaking),
+      body.meta_title || '', body.meta_description || '', body.meta_keywords || '', body.canonical_url || '',
+      publishedAt, scheduledAt
+    ).run();
+  } catch (e) {
+    console.error('Create news error:', e);
+    return fail('Create failed: ' + (e.message || 'unknown'), 500);
+  }
 
   const id = res.meta.last_row_id;
   await saveTags(env, id, body.tags);
@@ -198,47 +232,79 @@ export async function create(request, env) {
   return ok({ id, slug }, 'Article created');
 }
 
+/* ---------- UPDATE ---------- */
 export async function update(request, env, id) {
   const auth = await requireAdmin(request, env);
   if (auth.error) return auth.error;
   const body = await readJson(request);
+
   const existing = await env.DB.prepare(`SELECT * FROM news WHERE id = ?`).bind(id).first();
   if (!existing) return fail('Not found', 404);
 
+  // Slug
   let slug = existing.slug;
-  if (body.slug && slugify(body.slug) !== existing.slug) {
+  if (body.slug && slugify(body.slug) && slugify(body.slug) !== existing.slug) {
     slug = await uniqueSlug(env.DB, 'news', slugify(body.slug), id);
-  } else if (body.title && (!body.slug)) {
-    // keep slug stable unless explicitly changed — safer
   }
 
-  const status = ['draft','published','scheduled','archived'].includes(body.status) ? body.status : existing.status;
-  const visibility = body.visibility === 'private' ? 'private' : 'public';
-  const content = sanitizeHtml(body.content ?? existing.content);
-  let publishedAt = body.published_at || existing.published_at;
-  if (status === 'published' && !publishedAt) publishedAt = new Date().toISOString();
+  // FK normalization
+  const categoryId = body.category_id !== undefined ? normalizeFk(body.category_id) : existing.category_id;
+  const authorId = body.author_id !== undefined ? normalizeFk(body.author_id) : existing.author_id;
 
-  await env.DB.prepare(
-    `UPDATE news SET
-      title=?, slug=?, excerpt=?, content=?, featured_image=?, thumbnail=?,
-      category_id=?, author_id=?, status=?, visibility=?,
-      is_featured=?, is_trending=?, is_breaking=?,
-      meta_title=?, meta_description=?, meta_keywords=?, canonical_url=?,
-      published_at=?, scheduled_at=?, updated_at=datetime('now')
-     WHERE id=?`
-  ).bind(
-    body.title ?? existing.title, slug, body.excerpt ?? existing.excerpt, content,
-    body.featured_image ?? existing.featured_image, body.thumbnail ?? existing.thumbnail,
-    body.category_id ?? existing.category_id, body.author_id ?? existing.author_id,
-    status, visibility,
-    (body.is_featured ?? existing.is_featured) ? 1 : 0,
-    (body.is_trending ?? existing.is_trending) ? 1 : 0,
-    (body.is_breaking ?? existing.is_breaking) ? 1 : 0,
-    body.meta_title ?? existing.meta_title, body.meta_description ?? existing.meta_description,
-    body.meta_keywords ?? existing.meta_keywords, body.canonical_url ?? existing.canonical_url,
-    publishedAt, body.scheduled_at ?? existing.scheduled_at,
-    id
-  ).run();
+  // Status/visibility
+  const status = ['draft', 'published', 'scheduled', 'archived'].includes(body.status) ? body.status : existing.status;
+  const visibility = body.visibility === 'private' ? 'private' : (body.visibility === 'public' ? 'public' : existing.visibility);
+
+  // Dates
+  let publishedAt = body.published_at !== undefined ? normalizeDate(body.published_at) : existing.published_at;
+  const scheduledAt = body.scheduled_at !== undefined ? normalizeDate(body.scheduled_at) : existing.scheduled_at;
+  if (status === 'published' && !publishedAt) {
+    publishedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  }
+
+  // Content
+  const content = body.content !== undefined ? sanitizeHtml(body.content) : existing.content;
+
+  // Booleans
+  const isFeatured = body.is_featured !== undefined ? toBit(body.is_featured) : existing.is_featured;
+  const isTrending = body.is_trending !== undefined ? toBit(body.is_trending) : existing.is_trending;
+  const isBreaking = body.is_breaking !== undefined ? toBit(body.is_breaking) : existing.is_breaking;
+
+  try {
+    await env.DB.prepare(
+      `UPDATE news SET
+        title=?, slug=?, excerpt=?, content=?, featured_image=?, thumbnail=?,
+        category_id=?, author_id=?, status=?, visibility=?,
+        is_featured=?, is_trending=?, is_breaking=?,
+        meta_title=?, meta_description=?, meta_keywords=?, canonical_url=?,
+        published_at=?, scheduled_at=?, updated_at=datetime('now')
+       WHERE id=?`
+    ).bind(
+      body.title ?? existing.title,
+      slug,
+      body.excerpt ?? existing.excerpt ?? '',
+      content,
+      body.featured_image ?? existing.featured_image ?? '',
+      body.thumbnail ?? existing.thumbnail ?? '',
+      categoryId,
+      authorId,
+      status,
+      visibility,
+      isFeatured,
+      isTrending,
+      isBreaking,
+      body.meta_title ?? existing.meta_title ?? '',
+      body.meta_description ?? existing.meta_description ?? '',
+      body.meta_keywords ?? existing.meta_keywords ?? '',
+      body.canonical_url ?? existing.canonical_url ?? '',
+      publishedAt,
+      scheduledAt,
+      id
+    ).run();
+  } catch (e) {
+    console.error('Update news error:', e);
+    return fail('Update failed: ' + (e.message || 'unknown'), 500);
+  }
 
   if (body.tags !== undefined) await saveTags(env, id, body.tags);
   await env.DB.prepare(
@@ -248,6 +314,7 @@ export async function update(request, env, id) {
   return ok({ id, slug }, 'Article updated');
 }
 
+/* ---------- GET BY ID (admin) ---------- */
 export async function getById(request, env, id) {
   const auth = await requireAdmin(request, env);
   if (auth.error) return auth.error;
@@ -259,6 +326,7 @@ export async function getById(request, env, id) {
   return ok({ article: shapeArticle(row), tags: tags.results.map(t => t.name).join(', ') });
 }
 
+/* ---------- DELETE ---------- */
 export async function remove(request, env, id) {
   const auth = await requireAdmin(request, env);
   if (auth.error) return auth.error;
@@ -271,6 +339,7 @@ export async function remove(request, env, id) {
   return ok({}, 'Article deleted');
 }
 
+/* ---------- BULK ---------- */
 export async function bulk(request, env) {
   const auth = await requireAdmin(request, env);
   if (auth.error) return auth.error;
@@ -304,6 +373,7 @@ export async function bulk(request, env) {
   return ok({}, 'Bulk action applied');
 }
 
+/* ---------- DUPLICATE ---------- */
 export async function duplicate(request, env, id) {
   const auth = await requireAdmin(request, env);
   if (auth.error) return auth.error;
@@ -322,7 +392,7 @@ export async function duplicate(request, env, id) {
   return ok({ id: res.meta.last_row_id, slug: newSlug }, 'Duplicated');
 }
 
-/** Publish any scheduled news whose scheduled_at has arrived. Called from index.js */
+/* ---------- AUTO PUBLISH SCHEDULED ---------- */
 export async function autoPublishScheduled(env) {
   try {
     await env.DB.prepare(
