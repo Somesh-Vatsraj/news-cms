@@ -1,5 +1,6 @@
+// FILE: src/api/auth.js
 import { hashPassword, verifyPassword, randomToken, sha256Hex } from '../utils/crypto.js';
-import { ok, fail, setCookie, SESSION_COOKIE_UNUSED } from '../utils/response.js';
+import { ok, fail } from '../utils/response.js';
 import { readJson, isEmail, requireFields } from '../utils/validation.js';
 import { getCurrentUser, SESSION_COOKIE } from '../middleware/auth.js';
 
@@ -45,7 +46,6 @@ export async function login(request, env) {
 
   const { token } = await createSession(env, user.id);
 
-  // log
   await env.DB.prepare(
     `INSERT INTO activity_logs (user_id, action, entity_type, entity_id, ip_address, user_agent)
      VALUES (?, 'login', 'user', ?, ?, ?)`
@@ -125,7 +125,6 @@ export async function changePassword(request, env) {
     `UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?`
   ).bind(newHash, user.id).run();
 
-  // invalidate all sessions for this user (safer)
   await env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(user.id).run();
 
   const res = ok({}, 'Password updated. Please log in again.');
