@@ -1,0 +1,20 @@
+name = "news-cms"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "news_db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+SITE_URL = "https://example.com"
+ENVIRONMENT = "production"
+
+# Set secret:  npx wrangler secret put SESSION_SECRET
+# SESSION_SECRET = "set-via-wrangler-secret"
+
+[observability]
+enabled = true
