@@ -1,4 +1,3 @@
-// FILE: src/api/auth.js
 import { hashPassword, verifyPassword, randomToken, sha256Hex } from '../utils/crypto.js';
 import { ok, fail } from '../utils/response.js';
 import { readJson, isEmail, requireFields } from '../utils/validation.js';
