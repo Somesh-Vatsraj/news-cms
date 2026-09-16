@@ -46,6 +46,7 @@ npx wrangler d1 migrations apply DB --local
 ```
 
 ## 5. Local development
+<img width="1568" height="902" alt="Screenshot 2026-09-16 113217" src="https://github.com/user-attachments/assets/1acf0a20-4600-43f3-8456-7445dab8c1f9" />
 
 ```bash
 npm run dev
